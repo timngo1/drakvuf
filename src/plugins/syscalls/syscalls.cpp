@@ -109,6 +109,74 @@
 #include "syscalls.h"
 #include "winscproto.h"
 
+static char * objattr_read(drakvuf_t drakvuf, drakvuf_trap_info_t* info, addr_t attr)
+{
+    if ( !attr )
+        return 0;
+
+    syscall_wrapper_t* wrapper = (syscall_wrapper_t*)info->trap->data;
+    syscalls* s = wrapper->sc;
+    vmi_instance_t vmi = drakvuf_lock_and_get_vmi(drakvuf);
+
+    access_context_t ctx;
+    ctx.translate_mechanism = VMI_TM_PROCESS_DTB;
+    ctx.dtb = info->regs->cr3;
+
+    addr_t file_root_handle = 0;
+    ctx.addr = attr + s->objattr_root;
+    if ( VMI_FAILURE == vmi_read_addr(vmi, &ctx, &file_root_handle) )
+    {
+        drakvuf_release_vmi(drakvuf);
+        return 0;
+    }
+
+    char* file_root = drakvuf_get_filename_from_handle(drakvuf, info, file_root_handle);
+
+    ctx.addr = attr + s->objattr_name;
+    if ( VMI_FAILURE == vmi_read_addr(vmi, &ctx, &ctx.addr) )
+    {
+        g_free(file_root);
+        drakvuf_release_vmi(drakvuf);
+        return 0;
+    }
+
+    unicode_string_t* file_name_us = drakvuf_read_unicode(drakvuf, info, ctx.addr);
+    drakvuf_release_vmi(drakvuf);
+
+    if ( !file_name_us )
+    {
+        g_free(file_root);
+        return 0;
+    }
+
+    char* file_path = g_strdup_printf("%s%s%s",
+                                      file_root ?: "",
+                                      file_root ? "\\" : "",
+                                      file_name_us->contents);
+
+    vmi_free_unicode_str(file_name_us);
+    g_free(file_root);
+
+    return file_path;
+}
+
+static void print_semaphore_path(output_format_t format, char * filepath)
+{
+    switch (format)
+    {
+        case OUTPUT_CSV:
+            printf("%s", filepath);
+            break;
+        case OUTPUT_KV:
+            printf(",Name=%s", filepath);
+            break;
+        default:
+        case OUTPUT_DEFAULT:
+            printf(" Name %s", filepath);
+            break;
+    } 
+}
+
 static event_response_t linux_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
 {
 
@@ -308,6 +376,17 @@ static event_response_t win_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
     syscall_wrapper_t* wrapper = (syscall_wrapper_t*)info->trap->data;
     syscalls* s = wrapper->sc;
     const win_syscall_t* wsc = NULL;
+    char* filepath = NULL;
+    
+    if (!strncmp(info->trap->name, "NtCreateSemaphore", 17) ||
+        !strncmp(info->trap->name, "NtOpenSemaphore", 15) ) {
+        PRINT_DEBUG("TIM %s\n", info->trap->name);
+        addr_t attr = drakvuf_get_function_argument(drakvuf, info, 3);
+        if ( !attr ) {
+            attr = drakvuf_get_function_argument(drakvuf, info, 1);
+        }
+        filepath = objattr_read(drakvuf, info, attr);
+    }
 
     if (wrapper->syscall_index>-1 )
     {
@@ -367,6 +446,10 @@ static event_response_t win_cb(drakvuf_t drakvuf, drakvuf_trap_info_t* info)
     {
         print_nargs(s->format, nargs);
         print_args(s, drakvuf, info, wsc, buf);
+    }
+    if (filepath)
+    {
+        print_semaphore_path(s->format, filepath);
     }
     print_footer(s->format, nargs);
 
@@ -591,6 +674,10 @@ syscalls::syscalls(drakvuf_t drakvuf, const void* config, output_format_t output
     drakvuf_release_vmi(drakvuf);
 
     drakvuf_free_symbols(symbols);
+    if ( !drakvuf_get_struct_member_rva(drakvuf, "_OBJECT_ATTRIBUTES", "ObjectName", &this->objattr_name) )
+        fprintf(stderr, "TIM Error getting object name\n");
+    if ( !drakvuf_get_struct_member_rva(drakvuf, "_OBJECT_ATTRIBUTES", "RootDirectory", &this->objattr_root) )
+        fprintf(stderr, "TIM Error getting root directory\n");
 
     GSList* loop = this->traps;
     while (loop)

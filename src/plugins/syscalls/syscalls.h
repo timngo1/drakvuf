@@ -119,6 +119,8 @@ public:
     uint8_t reg_size;
     output_format_t format;
     os_t os;
+    addr_t objattr_name;
+    addr_t objattr_root;
 
     syscalls(drakvuf_t drakvuf, const void* config, output_format_t output);
     ~syscalls();
